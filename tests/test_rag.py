@@ -5,8 +5,6 @@ import numpy as np
 from nano_graphrag import GraphRAG, QueryParam
 from nano_graphrag._utils import wrap_embedding_func_with_attrs
 
-os.environ["OPENAI_API_KEY"] = "FAKE"
-
 WORKING_DIR = "./tests/nano_graphrag_cache_TEST"
 if not os.path.exists(WORKING_DIR):
     os.mkdir(WORKING_DIR)

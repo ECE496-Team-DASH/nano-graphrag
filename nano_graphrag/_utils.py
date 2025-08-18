@@ -49,18 +49,36 @@ def convert_response_to_json(response: str) -> dict:
         raise e from None
 
 
-def encode_string_by_tiktoken(content: str, model_name: str = "gpt-4o"):
+def encode_string_by_tiktoken(content: str, model_name: str = "cl100k_base"):
     global ENCODER
     if ENCODER is None:
-        ENCODER = tiktoken.encoding_for_model(model_name)
+        try:
+            # Try as encoding name first (for cl100k_base, etc.)
+            ENCODER = tiktoken.get_encoding(model_name)
+        except Exception:
+            try:
+                # Fallback to model name (for backwards compatibility)
+                ENCODER = tiktoken.encoding_for_model(model_name)
+            except Exception:
+                # Final fallback to a known good encoding
+                ENCODER = tiktoken.get_encoding("cl100k_base")
     tokens = ENCODER.encode(content)
     return tokens
 
 
-def decode_tokens_by_tiktoken(tokens: list[int], model_name: str = "gpt-4o"):
+def decode_tokens_by_tiktoken(tokens: list[int], model_name: str = "cl100k_base"):
     global ENCODER
     if ENCODER is None:
-        ENCODER = tiktoken.encoding_for_model(model_name)
+        try:
+            # Try as encoding name first (for cl100k_base, etc.)
+            ENCODER = tiktoken.get_encoding(model_name)
+        except Exception:
+            try:
+                # Fallback to model name (for backwards compatibility)
+                ENCODER = tiktoken.encoding_for_model(model_name)
+            except Exception:
+                # Final fallback to a known good encoding
+                ENCODER = tiktoken.get_encoding("cl100k_base")
     content = ENCODER.decode(tokens)
     return content
 
@@ -93,12 +111,10 @@ def load_json(file_name):
         return json.load(f)
 
 
-# it's dirty to type, so it's a good way to have fun
-def pack_user_ass_to_openai_messages(*args: str):
+def pack_user_ass_messages(*args: str):
+    """Pack alternating user/assistant messages (OpenAI-agnostic)."""
     roles = ["user", "assistant"]
-    return [
-        {"role": roles[i % 2], "content": content} for i, content in enumerate(args)
-    ]
+    return [{"role": roles[i % 2], "content": content} for i, content in enumerate(args)]
 
 
 def is_float_regex(value):

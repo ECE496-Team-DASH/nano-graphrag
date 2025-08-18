@@ -1,5 +1,4 @@
 future>=1.0.0
-openai
 tiktoken
 networkx
 graspologic
@@ -9,3 +8,5 @@ xxhash
 tenacity
 dspy-ai
 neo4j
+pydantic
+google-generativeai
