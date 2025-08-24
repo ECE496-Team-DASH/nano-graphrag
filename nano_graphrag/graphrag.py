@@ -45,15 +45,69 @@ from .base import (
 )
 from .prompt import GRAPH_FIELD_SEP
 
-# Optional Gemini imports will be attempted lazily to avoid hard dependency
+# Enhanced KG imports - using new enhanced_kg module
 try:  # pragma: no cover - best effort import
-    from gemini_create_nodes import gemini_create_nodes
-    from gemini_create_edges import create_edges_by_gemini
-    _HAS_GEMINI_CREATE_FUNCS = True
+    from .enhanced_kg import gemini_create_nodes, create_edges_by_gemini, EnhancedKG
+    _HAS_ENHANCED_KG_FUNCS = True
 except Exception:  # noqa: E722
     gemini_create_nodes = None  # type: ignore
     create_edges_by_gemini = None  # type: ignore
-    _HAS_GEMINI_CREATE_FUNCS = False
+    EnhancedKG = None  # type: ignore
+    _HAS_ENHANCED_KG_FUNCS = False
+
+# Genkg.py fallback for enhanced node/edge generation
+try:  # pragma: no cover - genkg.py fallback
+    if not _HAS_ENHANCED_KG_FUNCS:
+        # Try to import from genkg.py
+        import sys
+        from pathlib import Path
+        genkg_path = Path(__file__).parent.parent
+        if str(genkg_path) not in sys.path:
+            sys.path.insert(0, str(genkg_path))
+        
+        from genkg import GenerateKG
+        # Create a global genkg instance to use for node/edge creation
+        _genkg_instance = GenerateKG(llm_provider="gemini", model_name="gemini-2.5-flash")
+        
+        # Wrap genkg methods to match expected signatures
+        def gemini_create_nodes(content, node_limit, source_id):
+            """Wrapper for genkg.gemini_create_nodes"""
+            try:
+                return _genkg_instance.gemini_create_nodes(content, node_limit, source_id)
+            except Exception as e:
+                print(f"Error in genkg node creation: {e}")
+                return []
+        
+        def create_edges_by_gemini(nodes_with_source, papers_dict, model_name=None):
+            """Wrapper for genkg.create_edges_by_gemini"""
+            try:
+                # Convert nodes_with_source from (node_id, node_data) format to expected format
+                converted_nodes = [(node_data.get("description", node_id), node_data.get("source_id", "")) 
+                                 for node_id, node_data in nodes_with_source]
+                # genkg.py method expects summarized_papers, but we have papers_dict (full content)
+                # For now, just use the papers_dict as-is since it's passed as summarized_papers parameter
+                return _genkg_instance.create_edges_by_gemini(converted_nodes, papers_dict)
+            except Exception as e:
+                print(f"Error in genkg edge creation: {e}")
+                return []
+        
+        _HAS_GEMINI_CREATE_FUNCS = True
+        print("Using genkg.py for enhanced node and edge generation")
+    else:
+        _HAS_GEMINI_CREATE_FUNCS = True
+except Exception as e:  # noqa: E722
+    print(f"Failed to import genkg.py functions: {e}")
+    # Legacy fallback for old gemini functions
+    try:  # pragma: no cover - legacy fallback
+        from gemini_create_nodes import gemini_create_nodes as legacy_gemini_create_nodes
+        from gemini_create_edges import create_edges_by_gemini as legacy_create_edges_by_gemini
+        gemini_create_nodes = legacy_gemini_create_nodes
+        create_edges_by_gemini = legacy_create_edges_by_gemini
+        _HAS_GEMINI_CREATE_FUNCS = True
+        print("Using legacy gemini functions")
+    except Exception:  # noqa: E722
+        _HAS_GEMINI_CREATE_FUNCS = False
+        print("No enhanced node/edge generation functions available")
 
 
 @dataclass
@@ -350,7 +404,6 @@ class GraphRAG:
                         edges = create_edges_by_gemini(
                             list(merged_nodes.items()),  # but our items are node_id->data; adapt to expected format
                             papers_dict,
-                            model_name=self.gemini_model_name,
                         ) if create_edges_by_gemini else []
                     except Exception as e:  # pragma: no cover
                         logger.warning(f"Gemini edge creation failed: {e}")
