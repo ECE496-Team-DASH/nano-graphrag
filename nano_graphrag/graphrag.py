@@ -15,10 +15,14 @@ from ._llm import (
     azure_gpt_4o_complete,
     azure_openai_embedding,
     azure_gpt_4o_mini_complete,
+    gemini_2_5_flash_complete,
+    gemini_1_5_pro_complete,
+    gemini_embedding,
 )
 from ._op import (
     chunking_by_token_size,
     extract_entities,
+    extract_entities_genkg,
     generate_community_report,
     get_chunks,
     local_query,
@@ -100,17 +104,18 @@ class GraphRAG:
     )
 
     # text embedding
-    embedding_func: EmbeddingFunc = field(default_factory=lambda: openai_embedding)
+    embedding_func: EmbeddingFunc = field(default_factory=lambda: gemini_embedding)
     embedding_batch_num: int = 32
     embedding_func_max_async: int = 16
     query_better_than_threshold: float = 0.2
 
     # LLM
     using_azure_openai: bool = False
-    best_model_func: callable = gpt_4o_complete
+    using_gemini: bool = True
+    best_model_func: callable = gemini_2_5_flash_complete
     best_model_max_token_size: int = 32768
     best_model_max_async: int = 16
-    cheap_model_func: callable = gpt_4o_mini_complete
+    cheap_model_func: callable = gemini_2_5_flash_complete
     cheap_model_max_token_size: int = 32768
     cheap_model_max_async: int = 16
 
@@ -123,6 +128,14 @@ class GraphRAG:
     vector_db_storage_cls_kwargs: dict = field(default_factory=dict)
     graph_storage_cls: Type[BaseGraphStorage] = NetworkXStorage
     enable_llm_cache: bool = True
+
+    # GenKG integration
+    use_genkg_extraction: bool = False
+    genkg_node_limit: int = 25
+    genkg_llm_provider: str = "gemini"  
+    genkg_model_name: str = "gemini-2.5-flash"
+    genkg_create_visualization: bool = False
+    genkg_output_path: Optional[str] = None
 
     # extension
     always_create_working_dir: bool = True
@@ -144,6 +157,13 @@ class GraphRAG:
             logger.info(
                 "Switched the default openai funcs to Azure OpenAI if you didn't set any of it"
             )
+            
+        # Override with Gemini if using_gemini is True
+        if self.using_gemini:
+            logger.info("Using Gemini for LLM and embeddings")
+            self.best_model_func = gemini_2_5_flash_complete
+            self.cheap_model_func = gemini_2_5_flash_complete  
+            self.embedding_func = gemini_embedding
 
         if not os.path.exists(self.working_dir) and self.always_create_working_dir:
             logger.info(f"Creating working directory {self.working_dir}")
@@ -195,6 +215,15 @@ class GraphRAG:
             else None
         )
 
+        # Configure GenKG if enabled
+        if self.use_genkg_extraction:
+            logger.info("Using GenKG for entity extraction")
+            self.entity_extraction_func = extract_entities_genkg
+            
+            # Set default output path if not provided and visualization is enabled
+            if self.genkg_create_visualization and not self.genkg_output_path:
+                self.genkg_output_path = os.path.join(self.working_dir, "output.html")
+                
         self.best_model_func = limit_async_func_call(self.best_model_max_async)(
             partial(self.best_model_func, hashing_kv=self.llm_response_cache)
         )
@@ -312,6 +341,10 @@ class GraphRAG:
                 self.community_reports, self.chunk_entity_relation_graph, asdict(self)
             )
 
+            # ---------- generate GenKG visualizations if enabled
+            if self.use_genkg_extraction and self.genkg_create_visualization:
+                await self._generate_genkg_visualizations(inserting_chunks, new_docs)
+
             # ---------- commit upsertings and indexing
             await self.full_docs.upsert(new_docs)
             await self.text_chunks.upsert(inserting_chunks)
@@ -351,3 +384,58 @@ class GraphRAG:
                 continue
             tasks.append(cast(StorageNameSpace, storage_inst).index_done_callback())
         await asyncio.gather(*tasks)
+
+    async def _generate_genkg_visualizations(self, inserting_chunks, new_docs):
+        """
+        Generate GenKG HTML and JSON visualizations after successful entity extraction.
+        """
+        try:
+            logger.info("[GenKG Visualization] Generating output files...")
+            
+            # Import genkg 
+            import sys
+            # Try multiple possible genkg locations
+            possible_genkg_paths = [
+                os.path.join(self.working_dir, "..", "nano-graphrag", "genkg.py"),
+                os.path.join(self.working_dir, "..", "..", "nano-graphrag", "genkg.py"),
+                os.path.join(os.path.dirname(__file__), "..", "genkg.py"),
+            ]
+            
+            genkg_found = False
+            for genkg_path in possible_genkg_paths:
+                if os.path.exists(genkg_path):
+                    genkg_dir = os.path.dirname(genkg_path)
+                    if genkg_dir not in sys.path:
+                        sys.path.insert(0, genkg_dir)
+                    genkg_found = True
+                    break
+                    
+            if not genkg_found:
+                raise ImportError(f"GenKG not found in any of: {possible_genkg_paths}")
+                
+            from genkg import GenerateKG
+            
+            # Initialize GenKG
+            genkg = GenerateKG(
+                llm_provider=self.genkg_llm_provider,
+                model_name=self.genkg_model_name
+            )
+            
+            # Generate visualizations using the chunks
+            result = genkg.generate_knowledge_graph_from_chunks(
+                chunks_dict=inserting_chunks,
+                nodes_per_document=self.genkg_node_limit,
+                output_path=self.genkg_output_path,
+                create_visualization=True
+            )
+            
+            # Also create the .dashkg.json file
+            if self.genkg_output_path and result.get("knowledge_graph"):
+                dashkg_path = self.genkg_output_path.replace('.html', '.dashkg.json')
+                genkg.export_graph_to_dashkg_json(result["knowledge_graph"], dashkg_path)
+                
+            logger.info(f"[GenKG Visualization] Files generated: {self.genkg_output_path}")
+            
+        except Exception as e:
+            logger.error(f"Error generating GenKG visualizations: {e}")
+            # Don't fail the entire insertion if visualization fails

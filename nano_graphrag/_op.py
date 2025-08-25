@@ -369,9 +369,9 @@ async def extract_entities(
         already_processed += 1
         already_entities += len(maybe_nodes)
         already_relations += len(maybe_edges)
-        now_ticks = PROMPTS["process_tickers"][
-            already_processed % len(PROMPTS["process_tickers"])
-        ]
+        # Use ASCII-safe progress indicator to avoid Unicode issues on Windows
+        ascii_ticks = [".", "o", "O", "o"]
+        now_ticks = ascii_ticks[already_processed % len(ascii_ticks)]
         print(
             f"{now_ticks} Processed {already_processed} chunks, {already_entities} entities(duplicated), {already_relations} relations(duplicated)\r",
             end="",
@@ -416,6 +416,222 @@ async def extract_entities(
             for dp in all_entities_data
         }
         await entity_vdb.upsert(data_for_vdb)
+    return knwoledge_graph_inst
+
+
+async def extract_entities_genkg(
+    chunks: dict[str, TextChunkSchema],
+    knwoledge_graph_inst: BaseGraphStorage,
+    entity_vdb: BaseVectorStorage,
+    global_config: dict,
+) -> Union[BaseGraphStorage, None]:
+    """
+    Extract entities and relationships using GenKG methods instead of traditional LLM prompts.
+    This function maintains compatibility with nano-graphrag's pipeline while using genkg's 
+    enhanced entity extraction capabilities.
+    """
+    try:
+        # Import genkg locally to avoid startup dependencies
+        import sys
+        import os
+        # Try multiple possible genkg locations
+        possible_genkg_paths = [
+            os.path.join(global_config["working_dir"], "..", "nano-graphrag", "genkg.py"),
+            os.path.join(global_config["working_dir"], "..", "..", "nano-graphrag", "genkg.py"),
+            os.path.join(os.path.dirname(__file__), "..", "genkg.py"),
+        ]
+        
+        genkg_found = False
+        for genkg_path in possible_genkg_paths:
+            if os.path.exists(genkg_path):
+                genkg_dir = os.path.dirname(genkg_path)
+                if genkg_dir not in sys.path:
+                    sys.path.insert(0, genkg_dir)
+                genkg_found = True
+                break
+                
+        if not genkg_found:
+            raise ImportError(f"GenKG not found in any of: {possible_genkg_paths}")
+            
+        from genkg import GenerateKG
+    except ImportError as e:
+        logger.error(f"Failed to import GenKG: {e}")
+        raise ImportError(f"GenKG is required when use_genkg_extraction=True: {e}") from e
+    
+    # Initialize GenKG with configuration from global_config
+    genkg_provider = global_config.get("genkg_llm_provider", "gemini")
+    genkg_model = global_config.get("genkg_model_name", "gemini-2.5-flash")
+    genkg = GenerateKG(llm_provider=genkg_provider, model_name=genkg_model)
+    
+    ordered_chunks = list(chunks.items())
+    already_processed = 0
+    already_entities = 0
+    already_relations = 0
+
+    # Prepare paper texts for GenKG
+    papers_dict = {}
+    for chunk_key, chunk_data in ordered_chunks:
+        # Group chunks by document 
+        doc_id = chunk_data.get("full_doc_id", chunk_key)
+        if doc_id not in papers_dict:
+            papers_dict[doc_id] = ""
+        papers_dict[doc_id] += chunk_data["content"] + "\n\n"
+    
+    logger.info(f"Processing {len(papers_dict)} documents with GenKG")
+    
+    async def _process_document(doc_id: str, doc_content: str):
+        nonlocal already_processed, already_entities, already_relations
+        
+        # Summarize the document content first
+        try:
+            summary = genkg.summarize_paper(doc_content, doc_id)
+            
+            # Extract nodes using GenKG
+            node_limit = global_config.get("genkg_node_limit", 25)
+            nodes_with_source = genkg.gemini_create_nodes(summary, node_limit, doc_id)
+            
+            # Extract edges using GenKG 
+            edges = genkg.create_edges_by_gemini(
+                nodes_with_source, 
+                {doc_id: summary}
+            )
+            
+            # Convert GenKG format to nano-graphrag format
+            maybe_nodes = defaultdict(list)
+            maybe_edges = defaultdict(list)
+            
+            # Convert nodes
+            for node_text, source in nodes_with_source:
+                # Clean for Windows compatibility but preserve more content than before
+                # Replace problematic characters instead of removing them
+                clean_node_text = (node_text.strip()
+                                 .replace('(', ' ')
+                                 .replace(')', ' ')
+                                 .replace('-', ' ')
+                                 .replace('/', ' ')
+                                 .replace('&', 'AND'))
+                
+                # Convert to uppercase for nano-graphrag compatibility
+                clean_node_text = ' '.join(clean_node_text.split()).upper()  # Also normalize whitespace
+                
+                if not clean_node_text:
+                    continue  # Skip if empty after cleaning
+                    
+                entity_data = {
+                    "entity_name": clean_node_text,  # Uppercase normalized for compatibility
+                    "entity_type": "CONCEPT",  # GenKG doesn't provide types, use generic
+                    "description": node_text.strip(),  # Keep original for description
+                    "source_id": source,
+                }
+                maybe_nodes[entity_data["entity_name"]].append(entity_data)
+                already_entities += 1
+            
+            # Convert edges 
+            for (node1_with_source, node2_with_source, attrs) in edges:
+                node1_text, _ = node1_with_source
+                node2_text, _ = node2_with_source
+                
+                # Apply same normalization as nodes
+                def normalize_node_name(name):
+                    return ' '.join((name.strip()
+                                   .replace('(', ' ')
+                                   .replace(')', ' ')
+                                   .replace('-', ' ')
+                                   .replace('/', ' ')
+                                   .replace('&', 'AND')).split()).upper()
+                
+                clean_node1 = normalize_node_name(node1_text)
+                clean_node2 = normalize_node_name(node2_text)
+                clean_relation = attrs.get("relation", "related_to")
+                
+                if not clean_node1 or not clean_node2:
+                    continue  # Skip if either node name is empty after cleaning
+                
+                edge_data = {
+                    "src_id": clean_node1,  # Uppercase normalized for compatibility
+                    "tgt_id": clean_node2,  # Uppercase normalized for compatibility
+                    "weight": attrs.get("weight", 1.0),
+                    "description": clean_relation or "related_to",
+                    "source_id": doc_id,
+                }
+                maybe_edges[(edge_data["src_id"], edge_data["tgt_id"])].append(edge_data)
+                already_relations += 1
+                
+            already_processed += 1
+            # Use ASCII-safe progress indicator
+            ascii_ticks = [".", "o", "O", "o"]
+            now_ticks = ascii_ticks[already_processed % len(ascii_ticks)]
+            print(
+                f"{now_ticks} Processed {already_processed} documents, {already_entities} entities(duplicated), {already_relations} relations(duplicated)\r",
+                end="",
+                flush=True,
+            )
+            return dict(maybe_nodes), dict(maybe_edges)
+            
+        except Exception as e:
+            logger.error(f"Error processing document {doc_id} with GenKG: {e}")
+            raise RuntimeError(f"GenKG processing failed for document {doc_id}: {e}") from e
+    
+    # Process all documents
+    results = await asyncio.gather(
+        *[_process_document(doc_id, doc_content) for doc_id, doc_content in papers_dict.items()]
+    )
+    print()  # clear the progress bar
+    
+    # Merge results
+    maybe_nodes = defaultdict(list)
+    maybe_edges = defaultdict(list)
+    for m_nodes, m_edges in results:
+        for k, v in m_nodes.items():
+            maybe_nodes[k].extend(v)
+        for k, v in m_edges.items():
+            # it's undirected graph
+            maybe_edges[tuple(sorted(k))].extend(v)
+    
+    # Use nano-graphrag's existing merge functions
+    logger.info(f"About to merge {len(maybe_nodes)} node types and {len(maybe_edges)} edge types")
+    all_entities_data = await asyncio.gather(
+        *[
+            _merge_nodes_then_upsert(k, v, knwoledge_graph_inst, global_config)
+            for k, v in maybe_nodes.items()
+        ]
+    )
+    await asyncio.gather(
+        *[
+            _merge_edges_then_upsert(k[0], k[1], v, knwoledge_graph_inst, global_config)
+            for k, v in maybe_edges.items()
+        ]
+    )
+    
+    # Filter out any None results from merging
+    all_entities_data = [entity for entity in all_entities_data if entity is not None]
+    
+    if not len(all_entities_data):
+        raise RuntimeError("GenKG failed to extract any entities. Check your API keys and model configuration.")
+    
+    logger.info(f"GenKG successfully extracted {len(all_entities_data)} entities using GenKG methods")
+    
+    # Store in entity vector database
+    if entity_vdb is not None:
+        data_for_vdb = {
+            compute_mdhash_id(dp["entity_name"], prefix="ent-"): {
+                "content": dp["entity_name"] + dp["description"],
+                "entity_name": dp["entity_name"],
+            }
+            for dp in all_entities_data
+        }
+        await entity_vdb.upsert(data_for_vdb)
+    
+    # Store visualization data for later use
+    if global_config.get("genkg_create_visualization", False):
+        genkg_data = {
+            "nodes_with_source": [(dp["entity_name"], dp["source_id"]) for dp in all_entities_data],
+            "papers_dict": papers_dict,
+            "genkg_instance": genkg  # This won't serialize, but we'll recreate it later
+        }
+        # Store this in the global config for post-processing
+        global_config["_genkg_viz_data"] = genkg_data
+    
     return knwoledge_graph_inst
 
 
@@ -626,9 +842,9 @@ async def generate_community_report(
 
         data = use_string_json_convert_func(response)
         already_processed += 1
-        now_ticks = PROMPTS["process_tickers"][
-            already_processed % len(PROMPTS["process_tickers"])
-        ]
+        # Use ASCII-safe progress indicator
+        ascii_ticks = [".", "o", "O", "o"]
+        now_ticks = ascii_ticks[already_processed % len(ascii_ticks)]
         print(
             f"{now_ticks} Processed {already_processed} communities\r",
             end="",
