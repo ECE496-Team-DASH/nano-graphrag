@@ -58,7 +58,7 @@ class GraphRAG:
     )
     # graph mode
     enable_local: bool = True
-    enable_naive_rag: bool = False
+    enable_naive_rag: bool = True
 
     # text chunking
     chunk_func: Callable[
@@ -377,24 +377,27 @@ class GraphRAG:
             tasks.append(cast(StorageNameSpace, storage_inst).index_done_callback())
         await asyncio.gather(*tasks)
 
-    async def _query_done(self):
-        tasks = []
-        for storage_inst in [self.llm_response_cache]:
-            if storage_inst is None:
-                continue
-            tasks.append(cast(StorageNameSpace, storage_inst).index_done_callback())
-        await asyncio.gather(*tasks)
-
     async def _generate_genkg_visualizations(self, inserting_chunks, new_docs):
-        """
-        Generate GenKG HTML and JSON visualizations after successful entity extraction.
-        """
-        try:
-            logger.info("[GenKG Visualization] Generating output files...")
+        """Generate GenKG visualizations using the same normalized nodes as nano-graphrag"""
+        # Retrieve stored GenKG visualization data from file
+        import json
+        import os
+        viz_data_path = os.path.join(self.working_dir, "_genkg_viz_data.json")
+        if not os.path.exists(viz_data_path):
+            logger.warning("No GenKG visualization data found")
+            return
             
-            # Import genkg 
+        try:
+            with open(viz_data_path, 'r', encoding='utf-8') as f:
+                genkg_viz_data = json.load(f)
+        except Exception as e:
+            logger.error(f"Failed to load GenKG visualization data: {e}")
+            return
+        
+        try:
+            # Import genkg locally
             import sys
-            # Try multiple possible genkg locations
+            import os
             possible_genkg_paths = [
                 os.path.join(self.working_dir, "..", "nano-graphrag", "genkg.py"),
                 os.path.join(self.working_dir, "..", "..", "nano-graphrag", "genkg.py"),
@@ -411,31 +414,65 @@ class GraphRAG:
                     break
                     
             if not genkg_found:
-                raise ImportError(f"GenKG not found in any of: {possible_genkg_paths}")
+                logger.warning("GenKG not found for visualization")
+                return
                 
             from genkg import GenerateKG
+            logger.info("[GenKG Visualization] Creating output files from stored entities...")
             
-            # Initialize GenKG
-            genkg = GenerateKG(
-                llm_provider=self.genkg_llm_provider,
-                model_name=self.genkg_model_name
-            )
+            # Use the ALREADY PROCESSED data from nano-graphrag - no duplicate processing!
+            nodes_with_source = genkg_viz_data["nodes_with_source"]  # These are normalized nodes from nano-graphrag
+            edges_data = genkg_viz_data.get("edges", [])  # These are the edges already created
             
-            # Generate visualizations using the chunks
-            result = genkg.generate_knowledge_graph_from_chunks(
-                chunks_dict=inserting_chunks,
-                nodes_per_document=self.genkg_node_limit,
-                output_path=self.genkg_output_path,
-                create_visualization=True
-            )
+            # Create NetworkX graph directly from nano-graphrag processed data
+            import networkx as nx
+            knowledge_graph = nx.Graph()
             
-            # Also create the .dashkg.json file
-            if self.genkg_output_path and result.get("knowledge_graph"):
-                dashkg_path = self.genkg_output_path.replace('.html', '.dashkg.json')
-                genkg.export_graph_to_dashkg_json(result["knowledge_graph"], dashkg_path)
+            # Generate paper colors
+            all_sources = set(source for _, source in nodes_with_source)
+            distinctive_colors = ["#4285F4", "#EA4335", "#FBBC05", "#34A853", "#FF9900", "#146EB4"]
+            paper_colors = {source: distinctive_colors[i % len(distinctive_colors)] for i, source in enumerate(all_sources)}
+            
+            # Add nodes with attributes
+            for node_text, source in nodes_with_source:
+                knowledge_graph.add_node(node_text, 
+                                       source=source, 
+                                       color=paper_colors.get(source, "#808080"), 
+                                       title=f"Source: {source}")
+            
+            # Add edges from stored edge data
+            for edge_data in edges_data:
+                src_id = edge_data.get("src_id")
+                tgt_id = edge_data.get("tgt_id") 
+                weight = edge_data.get("weight", 1.0)
+                relation = edge_data.get("description", "related_to")
                 
-            logger.info(f"[GenKG Visualization] Files generated: {self.genkg_output_path}")
+                if src_id and tgt_id and src_id in knowledge_graph.nodes and tgt_id in knowledge_graph.nodes:
+                    knowledge_graph.add_edge(src_id, tgt_id, weight=weight, relation=relation)
+            
+            # Initialize GenKG only for visualization methods
+            genkg = GenerateKG(llm_provider=self.genkg_llm_provider, model_name=self.genkg_model_name)
+            
+            # Export to output.dashkg.json with normalized names
+            output_json_path = os.path.join(self.working_dir, "output.dashkg.json")
+            genkg.export_graph_to_dashkg_json(knowledge_graph, output_json_path)
+            
+            # Create HTML visualization
+            html_path = os.path.join(self.working_dir, "output.html")
+            genkg.advanced_graph_to_html(knowledge_graph, html_path, display=False)
+            
+            logger.info(f"[GenKG Visualization] Files generated: {html_path}")
+            logger.info(f"Generated visualizations with {len(knowledge_graph.nodes)} nodes, {len(knowledge_graph.edges)} edges")
             
         except Exception as e:
-            logger.error(f"Error generating GenKG visualizations: {e}")
-            # Don't fail the entire insertion if visualization fails
+            logger.error(f"Failed to generate GenKG visualizations: {e}")
+            import traceback
+            traceback.print_exc()
+
+    async def _query_done(self):
+        tasks = []
+        for storage_inst in [self.llm_response_cache]:
+            if storage_inst is None:
+                continue
+            tasks.append(cast(StorageNameSpace, storage_inst).index_done_callback())
+        await asyncio.gather(*tasks)

@@ -112,9 +112,22 @@ def get_chunks(new_docs, chunk_func=chunking_by_token_size, **chunk_func_params)
     )
 
     for chunk in chunks:
-        inserting_chunks.update(
-            {compute_mdhash_id(chunk["content"], prefix="chunk-"): chunk}
-        )
+        # Ensure chunk conforms to TextChunkSchema and store directly
+        # The storage expects TextChunkSchema: {"tokens": int, "content": str, "full_doc_id": str, "chunk_order_index": int}
+        chunk_id = compute_mdhash_id(chunk["content"], prefix="chunk-")
+        
+        # Validate chunk structure
+        if not isinstance(chunk, dict):
+            logger.warning(f"Invalid chunk structure: {type(chunk)}")
+            continue
+            
+        # Ensure all required fields are present
+        required_fields = ["tokens", "content", "full_doc_id", "chunk_order_index"]
+        if not all(field in chunk for field in required_fields):
+            logger.warning(f"Chunk missing required fields. Has: {list(chunk.keys())}, Required: {required_fields}")
+            continue
+            
+        inserting_chunks[chunk_id] = chunk
 
     return inserting_chunks
 
@@ -622,15 +635,34 @@ async def extract_entities_genkg(
         }
         await entity_vdb.upsert(data_for_vdb)
     
-    # Store visualization data for later use
+    # Store visualization data for later use (no duplicate processing needed)
     if global_config.get("genkg_create_visualization", False):
+        # Collect edges from the processed maybe_edges
+        edges_for_viz = []
+        for edge_key, edge_list in maybe_edges.items():
+            if edge_list:  # Take the first edge if there are duplicates
+                edge_data = edge_list[0]
+                edges_for_viz.append({
+                    "src_id": edge_data["src_id"],
+                    "tgt_id": edge_data["tgt_id"], 
+                    "weight": edge_data["weight"],
+                    "description": edge_data["description"]
+                })
+        
         genkg_data = {
             "nodes_with_source": [(dp["entity_name"], dp["source_id"]) for dp in all_entities_data],
-            "papers_dict": papers_dict,
-            "genkg_instance": genkg  # This won't serialize, but we'll recreate it later
+            "edges": edges_for_viz,  # Store the processed edges 
+            "papers_dict": papers_dict
         }
         # Store this in the global config for post-processing
         global_config["_genkg_viz_data"] = genkg_data
+        
+        # Also store it as a file for GraphRAG to access later
+        import json
+        import os
+        viz_data_path = os.path.join(global_config["working_dir"], "_genkg_viz_data.json")
+        with open(viz_data_path, 'w', encoding='utf-8') as f:
+            json.dump(genkg_data, f, indent=2, ensure_ascii=False)
     
     return knwoledge_graph_inst
 
@@ -979,18 +1011,32 @@ async def _find_most_related_text_unit_from_entities(
             }
     if any([v is None for v in all_text_units_lookup.values()]):
         logger.warning("Text chunks are missing, maybe the storage is damaged")
-    all_text_units = [
-        {"id": k, **v} for k, v in all_text_units_lookup.items() if v is not None
-    ]
+    all_text_units = []
+    for k, v in all_text_units_lookup.items():
+        if v is None:
+            continue
+        if not isinstance(v, dict):
+            logger.warning(f"Text unit data is not a dictionary: {v}")
+            continue
+        # Ensure the data structure is valid
+        if "data" not in v or v["data"] is None:
+            logger.warning(f"Text unit missing 'data' field: {k}")
+            continue
+        if not isinstance(v["data"], dict) or "content" not in v["data"]:
+            logger.warning(f"Text unit data missing 'content' field: {k}")
+            continue
+        all_text_units.append({"id": k, **v})
     all_text_units = sorted(
         all_text_units, key=lambda x: (x["order"], -x["relation_counts"])
     )
     all_text_units = truncate_list_by_token_size(
         all_text_units,
-        key=lambda x: x["data"]["content"],
+        key=lambda x: x.get("data", {}).get("content", ""),
         max_token_size=query_param.local_max_token_for_text_unit,
     )
-    all_text_units: list[TextChunkSchema] = [t["data"] for t in all_text_units]
+    all_text_units: list[TextChunkSchema] = [
+        t["data"] for t in all_text_units if t.get("data") is not None
+    ]
     return all_text_units
 
 
@@ -1004,7 +1050,16 @@ async def _find_most_related_edges_from_entities(
     )
     all_edges = set()
     for this_edges in all_related_edges:
-        all_edges.update([tuple(sorted(e)) for e in this_edges])
+        if this_edges is None:
+            continue
+        if not isinstance(this_edges, (list, tuple)):
+            logger.warning(f"Expected list/tuple for edges, got {type(this_edges)}")
+            continue
+        try:
+            all_edges.update([tuple(sorted(e)) for e in this_edges if e is not None])
+        except Exception as ex:
+            logger.warning(f"Error processing edges: {ex}. Edges data: {this_edges}")
+            continue
     all_edges = list(all_edges)
     all_edges_pack = await asyncio.gather(
         *[knowledge_graph_inst.get_edge(e[0], e[1]) for e in all_edges]
@@ -1012,17 +1067,29 @@ async def _find_most_related_edges_from_entities(
     all_edges_degree = await asyncio.gather(
         *[knowledge_graph_inst.edge_degree(e[0], e[1]) for e in all_edges]
     )
-    all_edges_data = [
-        {"src_tgt": k, "rank": d, **v}
-        for k, v, d in zip(all_edges, all_edges_pack, all_edges_degree)
-        if v is not None
-    ]
+    all_edges_data = []
+    for k, v, d in zip(all_edges, all_edges_pack, all_edges_degree):
+        if v is None:
+            continue
+        if not isinstance(v, dict):
+            logger.warning(f"Edge data is not a dictionary: {v}")
+            continue
+        try:
+            edge_data = {"src_tgt": k, "rank": d, **v}
+            # Validate that required fields exist
+            if not all(key in edge_data for key in ["src_tgt", "rank"]):
+                logger.warning(f"Edge missing required fields: {edge_data}")
+                continue
+            all_edges_data.append(edge_data)
+        except Exception as ex:
+            logger.warning(f"Error creating edge data for {k}: {ex}. Edge dict: {v}")
+            continue
     all_edges_data = sorted(
-        all_edges_data, key=lambda x: (x["rank"], x["weight"]), reverse=True
+        all_edges_data, key=lambda x: (x.get("rank", 0), x.get("weight", 0.0)), reverse=True
     )
     all_edges_data = truncate_list_by_token_size(
         all_edges_data,
-        key=lambda x: x["description"],
+        key=lambda x: x.get("description", ""),
         max_token_size=query_param.local_max_token_for_local_context,
     )
     return all_edges_data
@@ -1038,6 +1105,11 @@ async def _build_local_query_context(
 ):
     results = await entities_vdb.query(query, top_k=query_param.top_k)
     if not len(results):
+        logger.warning(f"No entities found in vector database for query: '{query}'")
+        logger.warning("This could mean:")
+        logger.warning("1. The query doesn't match any entities in your knowledge graph")
+        logger.warning("2. The entity vector database is empty or corrupted")
+        logger.warning("3. Try a different query or rebuild your knowledge graph")
         return None
     node_datas = await asyncio.gather(
         *[knowledge_graph_inst.get_node(r["entity_name"]) for r in results]
@@ -1081,16 +1153,33 @@ async def _build_local_query_context(
         ["id", "source", "target", "description", "weight", "rank"]
     ]
     for i, e in enumerate(use_relations):
-        relations_section_list.append(
-            [
-                i,
-                e["src_tgt"][0],
-                e["src_tgt"][1],
-                e["description"],
-                e["weight"],
-                e["rank"],
-            ]
-        )
+        # Add validation for edge data structure
+        if e is None:
+            logger.warning(f"Skipping None edge at index {i}")
+            continue
+            
+        if "src_tgt" not in e or e["src_tgt"] is None:
+            logger.warning(f"Skipping edge at index {i}: missing or None src_tgt field")
+            continue
+            
+        if not isinstance(e["src_tgt"], (list, tuple)) or len(e["src_tgt"]) < 2:
+            logger.warning(f"Skipping edge at index {i}: invalid src_tgt format - {e.get('src_tgt', 'None')}")
+            continue
+            
+        try:
+            relations_section_list.append(
+                [
+                    i,
+                    e["src_tgt"][0],
+                    e["src_tgt"][1],
+                    e.get("description", "UNKNOWN"),
+                    e.get("weight", 0.0),
+                    e.get("rank", 0),
+                ]
+            )
+        except Exception as ex:
+            logger.warning(f"Error processing edge at index {i}: {ex}. Edge data: {e}")
+            continue
     relations_context = list_of_list_to_csv(relations_section_list)
 
     communities_section_list = [["id", "content"]]
@@ -1143,6 +1232,11 @@ async def local_query(
     if query_param.only_need_context:
         return context
     if context is None:
+        logger.error("Local query failed: Could not build query context. This might be due to:")
+        logger.error("1. No matching entities found in the vector database")
+        logger.error("2. Corrupted knowledge graph data")
+        logger.error("3. Missing or incomplete storage components")
+        logger.error("Check the logs above for specific warnings about missing data")
         return PROMPTS["fail_response"]
     sys_prompt_temp = PROMPTS["local_rag_response"]
     sys_prompt = sys_prompt_temp.format(
