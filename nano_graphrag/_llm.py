@@ -259,7 +259,7 @@ async def gemini_2_5_flash_complete(
     prompt, system_prompt=None, history_messages=[], **kwargs
 ) -> str:
     return await gemini_complete_if_cache(
-        "gemini-2.5-flash",
+        "gemini-2.5-flash-lite",
         prompt,
         system_prompt=system_prompt,
         history_messages=history_messages,

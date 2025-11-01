@@ -133,7 +133,7 @@ class GraphRAG:
     use_genkg_extraction: bool = False
     genkg_node_limit: int = 25
     genkg_llm_provider: str = "gemini"  
-    genkg_model_name: str = "gemini-2.5-flash"
+    genkg_model_name: str = "gemini-2.5-flash-lite"
     genkg_create_visualization: bool = False
     genkg_output_path: Optional[str] = None
 

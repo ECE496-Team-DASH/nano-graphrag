@@ -47,7 +47,7 @@ class LLMProvider:
     
     def _get_default_model(self):
         if self.provider_type == "gemini":
-            return "gemini-2.5-flash"
+            return "gemini-2.5-flash-lite"
         return "default-model"
     
     def _initialize_client(self):

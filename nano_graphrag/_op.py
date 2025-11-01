@@ -473,7 +473,7 @@ async def extract_entities_genkg(
     
     # Initialize GenKG with configuration from global_config
     genkg_provider = global_config.get("genkg_llm_provider", "gemini")
-    genkg_model = global_config.get("genkg_model_name", "gemini-2.5-flash")
+    genkg_model = global_config.get("genkg_model_name", "gemini-2.5-flash-lite")
     genkg = GenerateKG(llm_provider=genkg_provider, model_name=genkg_model)
     
     ordered_chunks = list(chunks.items())
