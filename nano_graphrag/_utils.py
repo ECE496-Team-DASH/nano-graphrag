@@ -45,8 +45,23 @@ def convert_response_to_json(response: str) -> dict:
         data = json.loads(json_str)
         return data
     except json.JSONDecodeError as e:
-        logger.error(f"Failed to parse JSON: {json_str}")
-        raise e from None
+        # Try to fix common JSON issues from LLM responses
+        logger.warning(f"Initial JSON parse failed: {e}. Attempting to fix malformed JSON...")
+        try:
+            # Fix unescaped backslashes in strings (common LLM error)
+            # This regex finds backslashes not already escaped and not part of valid escape sequences
+            fixed_json = re.sub(
+                r'(?<!\\)\\(?!["\\/bfnrtu])',  # Find \ not preceded by \ and not followed by valid escape char
+                r'\\\\',  # Replace with \\
+                json_str
+            )
+            data = json.loads(fixed_json)
+            logger.info("Successfully parsed JSON after fixing escape sequences")
+            return data
+        except json.JSONDecodeError:
+            # If still fails, log and re-raise original error
+            logger.error(f"Failed to parse JSON even after fixes: {json_str}")
+            raise e from None
 
 
 def encode_string_by_tiktoken(content: str, model_name: str = "gpt-4o"):
