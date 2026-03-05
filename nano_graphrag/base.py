@@ -10,6 +10,7 @@ from ._utils import EmbeddingFunc
 class QueryParam:
     mode: Literal["local", "global", "naive"] = "global"
     only_need_context: bool = False
+    return_context: bool = False  # When True, query() returns (answer, context_list) instead of answer
     response_type: str = "Multiple Paragraphs"
     level: int = 2
     top_k: int = 20

@@ -59,9 +59,19 @@ def convert_response_to_json(response: str) -> dict:
             logger.info("Successfully parsed JSON after fixing escape sequences")
             return data
         except json.JSONDecodeError:
-            # If still fails, log and re-raise original error
-            logger.error(f"Failed to parse JSON even after fixes: {json_str}")
-            raise e from None
+            pass
+        # Last resort: use json_repair if available
+        try:
+            from json_repair import repair_json
+            repaired = repair_json(json_str)
+            data = json.loads(repaired)
+            logger.info("Successfully parsed JSON after json_repair")
+            return data
+        except Exception:
+            pass
+        # If still fails, log and re-raise original error
+        logger.error(f"Failed to parse JSON even after fixes: {json_str}")
+        raise e from None
 
 
 def encode_string_by_tiktoken(content: str, model_name: str = "gpt-4o"):

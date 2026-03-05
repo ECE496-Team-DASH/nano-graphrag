@@ -330,67 +330,72 @@ async def extract_entities(
         nonlocal already_processed, already_entities, already_relations
         chunk_key = chunk_key_dp[0]
         chunk_dp = chunk_key_dp[1]
-        content = chunk_dp["content"]
-        hint_prompt = entity_extract_prompt.format(**context_base, input_text=content)
-        final_result = await use_llm_func(hint_prompt)
+        try:
+            content = chunk_dp["content"]
+            hint_prompt = entity_extract_prompt.format(**context_base, input_text=content)
+            final_result = await use_llm_func(hint_prompt)
 
-        history = pack_user_ass_to_openai_messages(hint_prompt, final_result)
-        for now_glean_index in range(entity_extract_max_gleaning):
-            glean_result = await use_llm_func(continue_prompt, history_messages=history)
+            history = pack_user_ass_to_openai_messages(hint_prompt, final_result)
+            for now_glean_index in range(entity_extract_max_gleaning):
+                glean_result = await use_llm_func(continue_prompt, history_messages=history)
 
-            history += pack_user_ass_to_openai_messages(continue_prompt, glean_result)
-            final_result += glean_result
-            if now_glean_index == entity_extract_max_gleaning - 1:
-                break
+                history += pack_user_ass_to_openai_messages(continue_prompt, glean_result)
+                final_result += glean_result
+                if now_glean_index == entity_extract_max_gleaning - 1:
+                    break
 
-            if_loop_result: str = await use_llm_func(
-                if_loop_prompt, history_messages=history
-            )
-            if_loop_result = if_loop_result.strip().strip('"').strip("'").lower()
-            if if_loop_result != "yes":
-                break
-
-        records = split_string_by_multi_markers(
-            final_result,
-            [context_base["record_delimiter"], context_base["completion_delimiter"]],
-        )
-
-        maybe_nodes = defaultdict(list)
-        maybe_edges = defaultdict(list)
-        for record in records:
-            record = re.search(r"\((.*)\)", record)
-            if record is None:
-                continue
-            record = record.group(1)
-            record_attributes = split_string_by_multi_markers(
-                record, [context_base["tuple_delimiter"]]
-            )
-            if_entities = await _handle_single_entity_extraction(
-                record_attributes, chunk_key
-            )
-            if if_entities is not None:
-                maybe_nodes[if_entities["entity_name"]].append(if_entities)
-                continue
-
-            if_relation = await _handle_single_relationship_extraction(
-                record_attributes, chunk_key
-            )
-            if if_relation is not None:
-                maybe_edges[(if_relation["src_id"], if_relation["tgt_id"])].append(
-                    if_relation
+                if_loop_result: str = await use_llm_func(
+                    if_loop_prompt, history_messages=history
                 )
-        already_processed += 1
-        already_entities += len(maybe_nodes)
-        already_relations += len(maybe_edges)
-        # Use ASCII-safe progress indicator to avoid Unicode issues on Windows
-        ascii_ticks = [".", "o", "O", "o"]
-        now_ticks = ascii_ticks[already_processed % len(ascii_ticks)]
-        print(
-            f"{now_ticks} Processed {already_processed} chunks, {already_entities} entities(duplicated), {already_relations} relations(duplicated)\r",
-            end="",
-            flush=True,
-        )
-        return dict(maybe_nodes), dict(maybe_edges)
+                if_loop_result = if_loop_result.strip().strip('"').strip("'").lower()
+                if if_loop_result != "yes":
+                    break
+
+            records = split_string_by_multi_markers(
+                final_result,
+                [context_base["record_delimiter"], context_base["completion_delimiter"]],
+            )
+
+            maybe_nodes = defaultdict(list)
+            maybe_edges = defaultdict(list)
+            for record in records:
+                record = re.search(r"\((.*)\)", record)
+                if record is None:
+                    continue
+                record = record.group(1)
+                record_attributes = split_string_by_multi_markers(
+                    record, [context_base["tuple_delimiter"]]
+                )
+                if_entities = await _handle_single_entity_extraction(
+                    record_attributes, chunk_key
+                )
+                if if_entities is not None:
+                    maybe_nodes[if_entities["entity_name"]].append(if_entities)
+                    continue
+
+                if_relation = await _handle_single_relationship_extraction(
+                    record_attributes, chunk_key
+                )
+                if if_relation is not None:
+                    maybe_edges[(if_relation["src_id"], if_relation["tgt_id"])].append(
+                        if_relation
+                    )
+            already_processed += 1
+            already_entities += len(maybe_nodes)
+            already_relations += len(maybe_edges)
+            # Use ASCII-safe progress indicator to avoid Unicode issues on Windows
+            ascii_ticks = [".", "o", "O", "o"]
+            now_ticks = ascii_ticks[already_processed % len(ascii_ticks)]
+            print(
+                f"{now_ticks} Processed {already_processed} chunks, {already_entities} entities(duplicated), {already_relations} relations(duplicated)\r",
+                end="",
+                flush=True,
+            )
+            return dict(maybe_nodes), dict(maybe_edges)
+        except Exception as e:
+            logger.warning(f"Failed to process chunk '{chunk_key}': {e}. Skipping.")
+            already_processed += 1
+            return {}, {}
 
     # use_llm_func is wrapped in ascynio.Semaphore, limiting max_async callings
     results = await asyncio.gather(
@@ -1383,6 +1388,8 @@ async def local_query(
         query,
         system_prompt=sys_prompt,
     )
+    if query_param.return_context:
+        return response, [context]
     return response
 
 
@@ -1516,6 +1523,8 @@ Importance Score: {dp['score']}
             report_data=points_context, response_type=query_param.response_type
         ),
     )
+    if query_param.return_context:
+        return response, [points_context]
     return response
 
 
@@ -1550,4 +1559,6 @@ async def naive_query(
         query,
         system_prompt=sys_prompt,
     )
+    if query_param.return_context:
+        return response, [section]
     return response

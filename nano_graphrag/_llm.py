@@ -17,7 +17,7 @@ try:
 except ImportError:
     _HAS_GEMINI = False
 
-from ._utils import compute_args_hash, wrap_embedding_func_with_attrs
+from ._utils import compute_args_hash, wrap_embedding_func_with_attrs, logger
 from .base import BaseKVStorage
 
 global_openai_async_client = None
@@ -203,45 +203,87 @@ async def azure_openai_embedding(texts: list[str]) -> np.ndarray:
 # Gemini LLM and Embedding Functions
 
 @retry(
-    stop=stop_after_attempt(5),
-    wait=wait_exponential(multiplier=1, min=4, max=10),
+    stop=stop_after_attempt(8),
+    wait=wait_exponential(multiplier=2, min=10, max=120),
 )
 async def gemini_complete_if_cache(
     model, prompt, system_prompt=None, history_messages=[], **kwargs
 ) -> str:
     gemini_client = get_gemini_client_instance()
     hashing_kv: BaseKVStorage = kwargs.pop("hashing_kv", None)
-    
-    # Prepare the prompt for Gemini
-    full_prompt = ""
-    if system_prompt:
-        full_prompt += f"System: {system_prompt}\n\n"
-    
-    # Add history messages
-    for msg in history_messages:
-        role = msg.get("role", "user")
-        content = msg.get("content", "")
-        full_prompt += f"{role.capitalize()}: {content}\n\n"
-    
-    full_prompt += f"User: {prompt}"
-    
+
+    # Compute cache key from raw inputs before any reformatting
+    cache_key_str = (system_prompt or "") + str(history_messages) + prompt
     if hashing_kv is not None:
-        args_hash = compute_args_hash(model, full_prompt)
+        args_hash = compute_args_hash(model, cache_key_str)
         if_cache_return = await hashing_kv.get_by_id(args_hash)
         if if_cache_return is not None:
             return if_cache_return["return"]
 
-    # Remove unsupported kwargs for Gemini
-    gemini_kwargs = {k: v for k, v in kwargs.items() if k in ['temperature', 'max_tokens']}
-    
-    response = await gemini_client.aio.models.generate_content(
-        model=model,
-        contents=full_prompt,
-        **gemini_kwargs
-    )
-    
+    # Build GenerateContentConfig (google-genai >= 1.x API)
+    # AFC: set disable=True AND maximum_remote_calls=0 — both must agree or the
+    # SDK emits a warning ("disable is True but maximum_remote_calls is 10").
+    config = {"automatic_function_calling": {"disable": True, "maximum_remote_calls": 0}}
+
+    # Pass system prompt via the dedicated SDK field, not inline in contents
+    if system_prompt:
+        config["system_instruction"] = system_prompt
+
+    max_tokens = kwargs.pop("max_tokens", None)
+    if max_tokens is not None:
+        config["max_output_tokens"] = max_tokens
+    temperature = kwargs.pop("temperature", None)
+    if temperature is not None:
+        config["temperature"] = temperature
+    response_format = kwargs.pop("response_format", None)
+    if response_format and isinstance(response_format, dict) and response_format.get("type") == "json_object":
+        config["response_mime_type"] = "application/json"
+
+    # Disable safety filters so entity extraction is not blocked on sensitive corpora
+    config["safety_settings"] = [
+        {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+        {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+        {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+        {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+    ]
+
+    # Build multi-turn contents list in Gemini format.
+    # History messages arrive in OpenAI format (role: "user"/"assistant");
+    # Gemini uses "model" for assistant turns.
+    contents = []
+    for msg in history_messages:
+        role = msg.get("role", "user")
+        gemini_role = "model" if role == "assistant" else "user"
+        contents.append({"role": gemini_role, "parts": [{"text": msg.get("content", "")}]})
+    contents.append({"role": "user", "parts": [{"text": prompt}]})
+
+    generate_kwargs = {"model": model, "contents": contents, "config": config}
+
+    response = await gemini_client.aio.models.generate_content(**generate_kwargs)
+
+    # NO_CANDIDATES means the model produced no output at all (e.g. prompt too long,
+    # unsupported content type). This is non-transient — return "" instead of retrying.
+    if not response.candidates:
+        logger.warning(
+            f"Gemini returned NO_CANDIDATES (model={model}). Returning empty string for this call."
+        )
+        return ""
+
+    # response.text can be None when a safety filter blocks the chosen candidate.
+    # Raise so tenacity can retry (transient blocks may resolve on the next attempt).
+    if response.text is None:
+        finish_reason = None
+        try:
+            finish_reason = response.candidates[0].finish_reason
+        except Exception:
+            pass
+        raise ValueError(
+            f"Gemini returned None text (model={model}, finish_reason={finish_reason}). "
+            "Likely a safety filter block."
+        )
+
     result = response.text.strip()
-    
+
     if hashing_kv is not None:
         await hashing_kv.upsert(
             {
@@ -281,8 +323,8 @@ async def gemini_1_5_pro_complete(
 
 @wrap_embedding_func_with_attrs(embedding_dim=3072, max_token_size=8192)
 @retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=4, max=10),
+    stop=stop_after_attempt(8),
+    wait=wait_exponential(multiplier=2, min=10, max=120),
 )
 async def gemini_embedding(texts: list[str]) -> np.ndarray:
     gemini_client = get_gemini_client_instance()
